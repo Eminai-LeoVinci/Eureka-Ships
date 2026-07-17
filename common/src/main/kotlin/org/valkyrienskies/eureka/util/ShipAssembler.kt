@@ -1,0 +1,282 @@
+package org.valkyrienskies.eureka.util
+
+import com.google.common.collect.Sets
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
+import net.minecraft.core.BlockPos
+import net.minecraft.core.Direction
+import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.block.Block
+import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.Rotation
+import net.minecraft.world.level.block.SnowLayerBlock
+import net.minecraft.world.level.block.state.BlockState
+import org.joml.AxisAngle4d
+import org.joml.Matrix4d
+import org.joml.Vector3d
+import org.valkyrienskies.core.api.ships.ServerShip
+import org.valkyrienskies.core.util.datastructures.DenseBlockPosSet
+import org.valkyrienskies.eureka.EurekaConfig
+import org.valkyrienskies.mod.common.assembly.ShipAssembler as VSShipAssembler
+import org.valkyrienskies.mod.common.executeIf
+import org.valkyrienskies.mod.common.isTickingChunk
+import org.valkyrienskies.mod.common.networking.PacketRestartChunkUpdates
+import org.valkyrienskies.mod.common.networking.PacketStopChunkUpdates
+import org.valkyrienskies.mod.common.playerWrapper
+import org.valkyrienskies.mod.common.util.toJOML
+import org.valkyrienskies.mod.common.vsCore
+import org.valkyrienskies.mod.util.logger
+import org.valkyrienskies.mod.util.relocateBlock
+import org.valkyrienskies.mod.util.updateBlock
+import kotlin.collections.set
+import kotlin.math.*
+
+object ShipAssembler {
+    // BFS-collect the connected block set (world coordinates) that would become a ship, or null if it
+    // exceeds maxShipBlocks. Deliberately does NOT clear snow or create the ship, so a caller can inspect
+    // (and, for the Eureka Assembler, mutate) the world set and still abort cleanly before anything is built.
+    fun collectBlockPositions(level: ServerLevel, center: BlockPos, predicate: (BlockState) -> Boolean): HashSet<BlockPos>? {
+        val blocks = DenseBlockPosSet()
+
+        blocks.add(center.toJOML())
+        if (!bfs(level, center, blocks, predicate)) return null
+
+        val blockPositions = HashSet<BlockPos>()
+        blocks.forEach { x, y, z -> blockPositions.add(BlockPos(x, y, z)) }
+        return blockPositions
+    }
+
+    // Turn a collected block set into a ship. Must run AFTER any pre-assembly world edits, since
+    // VSShipAssembler reads the current world state into the ship. Clears orphaned resting snow first.
+    fun finishAssembly(level: ServerLevel, blockPositions: Set<BlockPos>): ServerShip {
+        clearRestingSnowLayers(level, blockPositions)
+        return VSShipAssembler.assembleToShip(level, blockPositions, 1.0)
+    }
+
+    // Back-compat one-shot collect-then-assemble (no pre-assembly hook). Kept for any external callers;
+    // the helm now drives the two steps directly so it can run the Eureka Assembler in between.
+    fun collectBlocks(level: ServerLevel, center: BlockPos, predicate: (BlockState) -> Boolean): ServerShip? =
+        collectBlockPositions(level, center, predicate)?.let { finishAssembly(level, it) }
+
+    // Snow layers (minecraft:snow) are in the assemble_blacklist, so they're never collected into the
+    // ship -- but excluding them just leaves them behind in the world, hovering over the spot the deck
+    // used to occupy, where (once they stack up) their collision box stops the player from moving. A
+    // layer always rests directly on the block beneath it, so any layer sitting on top of an assembled
+    // block is one that would be orphaned: delete it before the ship relocates to the shipyard. Whole
+    // snow blocks (minecraft:snow_block) are NOT SnowLayerBlock, so they assemble with the ship as usual.
+    private fun clearRestingSnowLayers(level: ServerLevel, blockPositions: Set<BlockPos>) {
+        val above = BlockPos.MutableBlockPos()
+        for (pos in blockPositions) {
+            above.set(pos.x, pos.y + 1, pos.z)
+            // Another ship block sits directly on top -- can't be a resting layer, and skips a world read.
+            if (blockPositions.contains(above)) continue
+            if (level.getBlockState(above).block is SnowLayerBlock) {
+                level.setBlock(above, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS)
+            }
+        }
+    }
+
+    private fun roundToNearestMultipleOf(number: Double, multiple: Double) = multiple * round(number / multiple)
+
+    // modified from https://gamedev.stackexchange.com/questions/83601/from-3d-rotation-snap-to-nearest-90-directions
+    private fun snapRotation(direction: AxisAngle4d): AxisAngle4d {
+        val x = abs(direction.x)
+        val y = abs(direction.y)
+        val z = abs(direction.z)
+        val angle = roundToNearestMultipleOf(direction.angle, PI / 2)
+
+        return if (x > y && x > z) {
+            direction.set(angle, direction.x.sign, 0.0, 0.0)
+        } else if (y > x && y > z) {
+            direction.set(angle, 0.0, direction.y.sign, 0.0)
+        } else {
+            direction.set(angle, 0.0, 0.0, direction.z.sign)
+        }
+    }
+
+    private fun rotationFromAxisAngle(axis: AxisAngle4d): Rotation {
+        if (axis.y.absoluteValue < 0.1) {
+            // if the axis isn't Y, either we're tilted up/down (which should not happen often) or we haven't moved and it's
+            // along the z axis with a magnitude of 0 for some reason. In these cases, we don't rotate.
+            return Rotation.NONE
+        }
+
+        // normalize into counterclockwise rotation (i.e. positive y-axis, according to testing + right hand rule)
+        if (axis.y.sign < 0.0) {
+            axis.y = 1.0
+            // the angle is always positive and < 2pi coming in
+            axis.angle = 2.0 * PI - axis.angle
+            axis.angle %= (2.0 * PI)
+        }
+
+        val eps = 0.001
+        if (axis.angle < eps)
+            return Rotation.NONE
+        else if ((axis.angle - PI / 2.0).absoluteValue < eps)
+            return Rotation.COUNTERCLOCKWISE_90
+        else if ((axis.angle - PI).absoluteValue < eps)
+            return Rotation.CLOCKWISE_180
+        else if ((axis.angle - 3.0 * PI / 2.0).absoluteValue < eps)
+            return Rotation.CLOCKWISE_90
+        else {
+            logger.warn("failed to convert $axis into a rotation")
+            return Rotation.NONE
+        }
+    }
+
+    fun unfillShip(level: ServerLevel, ship: ServerShip, shipCenter: BlockPos, center: BlockPos) {
+        ship.isStatic = true
+
+        val rotation: Rotation = ship.transform.shipToWorldRotation
+            .let(::AxisAngle4d)
+            .let(ShipAssembler::snapRotation)
+            .let(::rotationFromAxisAngle)
+
+        // ship's rotation rounded to nearest 90*
+        val shipToWorld = ship.transform.run {
+            Matrix4d()
+                .translate(positionInWorld)
+                .rotate(snapRotation(AxisAngle4d(shipToWorldRotation)))
+                .scale(shipToWorldScaling)
+                .translate(-positionInShip.x(), -positionInShip.y(), -positionInShip.z())
+        }
+
+        val alloc0 = Vector3d()
+
+        val chunksToBeUpdated = mutableMapOf<ChunkPos, Pair<ChunkPos, ChunkPos>>()
+
+        ship.activeChunksSet.forEach { chunkX, chunkZ ->
+            chunksToBeUpdated[ChunkPos(chunkX, chunkZ)] =
+                Pair(ChunkPos(chunkX, chunkZ), ChunkPos(chunkX, chunkZ))
+        }
+
+        val chunkPairs = chunksToBeUpdated.values.toList()
+        val chunkPoses = chunkPairs.flatMap { it.toList() }
+        val chunkPosesJOML = chunkPoses.map { it.toJOML() }
+
+        // Send a list of all the chunks that we plan on updating to players, so that they
+        // defer all updates until assembly is finished
+        level.players().forEach { player ->
+            with (vsCore.simplePacketNetworking) {
+                PacketStopChunkUpdates(chunkPosesJOML).sendToClient(player.playerWrapper)
+            }
+        }
+
+        val toUpdate = Sets.newHashSet<Triple<BlockPos, BlockPos, BlockState>>()
+
+        ship.activeChunksSet.forEach { chunkX, chunkZ ->
+            val chunk = level.getChunk(chunkX, chunkZ)
+            for (sectionIndex in 0 until chunk.sections.size) {
+                val section = chunk.sections[sectionIndex]
+
+                if (section == null || section.hasOnlyAir()) continue
+
+                val bottomY = sectionIndex shl 4
+
+                for (x in 0..15) {
+                    for (y in 0..15) {
+                        for (z in 0..15) {
+                            val state = section.getBlockState(x, y, z)
+                            if (state.isAir) continue
+
+                            val realX = (chunkX shl 4) + x
+                            val realY = bottomY + y + level.minY
+                            val realZ = (chunkZ shl 4) + z
+
+                            val inWorldPos = shipToWorld.transformPosition(alloc0.set(realX + 0.5, realY + 0.5, realZ + 0.5)).floor()
+
+                            val inWorldBlockPos = BlockPos(inWorldPos.x.toInt(), inWorldPos.y.toInt(), inWorldPos.z.toInt())
+                            val inShipPos = BlockPos(realX, realY, realZ)
+
+                            toUpdate.add(Triple(inShipPos, inWorldBlockPos, state))
+                            level.relocateBlock(inShipPos, inWorldBlockPos, false, null, rotation)
+                        }
+                    }
+                }
+            }
+        }
+        // We update the blocks after they're set to prevent blocks from breaking
+        for (triple in toUpdate) {
+            updateBlock(level, triple.first, triple.second, triple.third)
+        }
+
+        level.server.executeIf(
+            // This condition will return true if all modified chunks have been both loaded AND
+            // chunk update packets were sent to players
+            { chunkPoses.all(level::isTickingChunk) }
+        ) {
+            // Once all the chunk updates are sent to players, we can tell them to restart chunk updates
+            level.players().forEach { player ->
+                with (vsCore.simplePacketNetworking) {
+                    PacketRestartChunkUpdates(chunkPosesJOML).sendToClient(player.playerWrapper)
+                }
+            }
+        }
+    }
+
+    private fun bfs(
+        level: ServerLevel,
+        start: BlockPos,
+        blocks: DenseBlockPosSet,
+        predicate: (BlockState) -> Boolean
+    ): Boolean {
+
+        val blacklist = DenseBlockPosSet()
+        val stack = ObjectArrayList<BlockPos>()
+
+        // Mark seeds as visited as they're queued -- the SAME guard the pop loop uses below. Without it,
+        // start's neighbors sit on the stack un-blacklisted, so once start itself is reached (a neighbor
+        // re-offers it) it re-offers those same neighbors and they get processed a SECOND time. That
+        // double-fires the predicate's side effects (the helm's floater/balloon/blockCount tally),
+        // inflating the counts the assembler and applyControl consume. start is deliberately NOT
+        // blacklisted: it must be reachable exactly once so ShipHelmBlock is counted (helms >= 1).
+        directions(start) {
+            if (!blacklist.contains(it.x, it.y, it.z)) {
+                blacklist.add(it.x, it.y, it.z)
+                stack.push(it)
+            }
+        }
+
+        while (!stack.isEmpty) {
+            val pos = stack.pop()
+
+            if (predicate(level.getBlockState(pos))) {
+                blocks.add(pos.x, pos.y, pos.z)
+                directions(pos) {
+                    if (!blacklist.contains(it.x, it.y, it.z)) {
+                        blacklist.add(it.x, it.y, it.z)
+                        stack.push(it)
+                    }
+                }
+            }
+            if ((EurekaConfig.SERVER.maxShipBlocks > 0) and (blocks.size > EurekaConfig.SERVER.maxShipBlocks)) {
+                logger.info("Stopped ship assembly due too many blocks")
+                return false
+            }
+        }
+        if (EurekaConfig.SERVER.maxShipBlocks > 0) {
+            logger.info("Assembled ship with ${blocks.size} blocks, out of ${EurekaConfig.SERVER.maxShipBlocks} allowed")
+        }
+        return true
+    }
+
+    private fun directions(center: BlockPos, lambda: (BlockPos) -> Unit) {
+        // diagonals=false means 6-connectivity ONLY; without this return the 26-neighbor loop
+        // below always ran too, making the toggle a no-op (bug inherited from upstream).
+        if (!EurekaConfig.SERVER.diagonals) {
+            Direction.entries.forEach { lambda(center.relative(it)) }
+            return
+        }
+        for (x in -1..1) {
+            for (y in -1..1) {
+                for (z in -1..1) {
+                    if (x != 0 || y != 0 || z != 0) {
+                        lambda(center.offset(x, y, z))
+                    }
+                }
+            }
+        }
+    }
+
+    private val logger by logger()
+}
