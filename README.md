@@ -1,4 +1,9 @@
 <p align="center">
+<img src="vs_eureka_logo.png" alt="Eureka">
+</p>
+
+---
+<p align="center">
 <a href="https://www.valkyrienskies.org/"><img src="https://img.shields.io/badge/Website-white?style=for-the-badge&logo=html5&logoColor=black" alt="Website"></a>
 <a href="https://www.curseforge.com/minecraft/mc-mods/eureka-ships"><img src="https://img.shields.io/badge/CurseForge-white?style=for-the-badge&logo=curseforge" alt="CurseForge"></a>
 <a href="https://modrinth.com/mod/eureka"><img src="https://img.shields.io/badge/Modrinth-white?style=for-the-badge&logo=modrinth" alt="Modrinth"></a>
