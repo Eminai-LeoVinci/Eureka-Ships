@@ -29,10 +29,13 @@ import kotlin.math.min
  *
  * When the assembling player has a mode enabled ([AssemblerPreferences]):
  *  - `floater`: computes how many floaters keep the keel at the waterline (interior dry) and replaces
- *    the lowest whitelisted hull blocks (planks first, then logs -- config order) with floaters.
+ *    whitelisted hull blocks with floaters, LAYER BY LAYER FROM THE KEEL UP -- each layer is drained
+ *    across the whole material whitelist (oak plank, then spruce, then logs -- config order) before the
+ *    next layer up, so the buoyancy stays packed as low as possible.
  *  - `balloon`: computes how many balloons let the ship ASCEND (sized for a target climb speed, not just
- *    neutral hover -- see [GRAVITY_MAGNITUDE] / assemblerBalloonAscendRate) and replaces the lowest
- *    whitelisted hull blocks (wool by default) with balloons.
+ *    neutral hover -- see [GRAVITY_MAGNITUDE] / assemblerBalloonAscendRate) and replaces whitelisted hull
+ *    blocks (wool by default) with balloons, LAYER BY LAYER FROM THE TOP DOWN (same per-layer whitelist
+ *    drain), so the lift stays packed as high as possible.
  *  - both: balloons sized for flight + floaters sized for the resting waterline; Eureka's water
  *    altitude-hold then pins the keel at the surface until the ship flies.
  *
@@ -105,12 +108,17 @@ object EurekaAssembler {
         null -> EurekaBlocks.BALLOON.get()
     }
 
-    // Candidate hull positions whose block id is in [whitelist], sorted by material priority
-    // (whitelist index) then bottom-up (Y asc, then X/Z for determinism).
+    // Candidate hull positions whose block id is in [whitelist], sorted LAYER-MAJOR: fill exhausts the
+    // ENTIRE material whitelist on one layer before moving to the next, so lift blocks stay packed at the
+    // extreme layer (floaters lowest, balloons highest) instead of a single material draining top-to-bottom
+    // first. Primary key is Y (asc when [bottomUp], desc otherwise); WITHIN a layer the whitelist index
+    // still decides which material converts first (oak plank before spruce, ...); X/Z break ties for
+    // determinism.
     private fun candidates(
         level: ServerLevel,
         positions: Set<BlockPos>,
-        whitelist: List<String>
+        whitelist: List<String>,
+        bottomUp: Boolean
     ): List<Candidate> {
         if (whitelist.isEmpty()) return emptyList()
         val priority = HashMap<String, Int>(whitelist.size)
@@ -122,8 +130,10 @@ object EurekaAssembler {
             val idx = priority[idOf(state.block)] ?: continue
             ranked.add(idx to Candidate(pos, massOf(state), state.block))
         }
+        val byLayer: Comparator<Pair<Int, Candidate>> =
+            if (bottomUp) compareBy { it.second.pos.y } else compareByDescending { it.second.pos.y }
         ranked.sortWith(
-            compareBy({ it.first }, { it.second.pos.y }, { it.second.pos.x }, { it.second.pos.z })
+            byLayer.thenBy { it.first }.thenBy { it.second.pos.x }.thenBy { it.second.pos.z }
         )
         return ranked.map { it.second }
     }
@@ -159,10 +169,12 @@ object EurekaAssembler {
         val floaterMass = massOf(floaterState)
         val balloonMass = massOf(balloonState)
 
+        // Floaters fill lowest layer first (keep buoyancy at the keel); balloons fill highest layer first
+        // (keep lift up top). Each layer is drained across the whole whitelist before the next -- see candidates().
         val floaterCandidates =
-            if (floaterMode) candidates(level, positions, cfg.assemblerFloaterReplaceWhitelist) else emptyList()
+            if (floaterMode) candidates(level, positions, cfg.assemblerFloaterReplaceWhitelist, bottomUp = true) else emptyList()
         val balloonCandidates =
-            if (balloonMode) candidates(level, positions, cfg.assemblerBalloonReplaceWhitelist) else emptyList()
+            if (balloonMode) candidates(level, positions, cfg.assemblerBalloonReplaceWhitelist, bottomUp = false) else emptyList()
 
         val baseMass = positions.sumOf { massOf(level.getBlockState(it)) }
         val liftPerBalloon = cfg.massPerBalloon * cfg.balloonLiftMultiplier
