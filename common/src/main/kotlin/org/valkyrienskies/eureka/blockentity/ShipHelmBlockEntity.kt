@@ -341,6 +341,12 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         val blockState = level.getBlockState(blockPos)
         if (blockState.block !is ShipHelmBlock) return
 
+        // Capture the helm's forward (bow) direction NOW, while the helm is still in the world and ship space is
+        // about to be frozen aligned to world axes. This is the same value VSGamePackets records via
+        // seat.direction.opposite, so it seeds ShipInfluenceOrientation at ASSEMBLY -- locking the influence-border
+        // faces to the helm the instant the ship exists, instead of waiting for a player to mount it. See [assemble].
+        val forwardAtAssembly = helmSeatDirection
+
         // Collect the connected block set WITHOUT building the ship yet, so the Eureka Assembler can swap
         // hull blocks (and abort cleanly) before anything is committed to a ship.
         val blockPositions = ShipAssembler.collectBlockPositions(
@@ -405,6 +411,16 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
 
         val builtShip = ShipAssembler.finishAssembly(level, blockPositions)
 
+        // Lock the influence-border orientation to the helm's facing at assembly (method 1): the Front/Back/Left/
+        // Right faces follow the bow from the moment the ship is created, so the expand/contract commands and the
+        // border wireframe are correct immediately -- no longer wrong until someone sits at the helm. The mount-time
+        // observeForward calls (VSGamePackets / ShipMountingEntity) still run and write this same value, so they act
+        // as a harmless refresh and keep legacy ships (assembled before this change) and the MP client wireframe correct.
+        // Seeded reflectively: ShipInfluenceOrientation is a VS2-120 port addition absent from the official VS2 2.4.10
+        // API Eureka compiles against (the one-jar strategy), so a direct call wouldn't build; on official VS2 the
+        // class is absent and this no-ops, leaving the mount-time seeding as the sole path there.
+        InfluenceOrientationBridge.seedForward(builtShip.id, forwardAtAssembly)
+
         // Apply the captured stats onto the ship's EurekaShipControl once its ShipObject exists (mirrors how the
         // block onPlace counters attach). Plain fields, so they never trip the attachment's deleteIfEmpty.
         EurekaShipControl.deferUntilLoaded(builtShip) {
@@ -468,4 +484,35 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         return startRiding(player, force, blockPos, blockState, level as ServerLevel)
     }
     private val logger by logger()
+}
+
+/**
+ * Reflective bridge to VS2-120's `ShipInfluenceOrientation.observeForward`, which records a ship's forward (bow)
+ * direction so the influence-border faces (Front/Back/Left/Right) follow the helm. That class is a VS2-120 port
+ * addition and is NOT on the official VS2 2.4.10 API Eureka compiles against (the one-jar strategy), so we resolve
+ * it reflectively against the runtime jar (cached after the first call). On official VS2 the class is absent and
+ * [seedForward] is a no-op, so the border there relies solely on the mount-time seeding.
+ */
+private object InfluenceOrientationBridge {
+    private var resolved = false
+    private var instance: Any? = null
+    private var method: java.lang.reflect.Method? = null
+
+    fun seedForward(shipId: Long, forward: Direction) {
+        if (!resolved) {
+            try {
+                val clazz = Class.forName("org.valkyrienskies.mod.common.util.ShipInfluenceOrientation")
+                instance = clazz.getField("INSTANCE").get(null)
+                method = clazz.getMethod("observeForward", java.lang.Long.TYPE, Direction::class.java)
+            } catch (e: ReflectiveOperationException) {
+                method = null // official VS2: no helm-oriented influence border to seed
+            }
+            resolved = true
+        }
+        try {
+            method?.invoke(instance, shipId, forward)
+        } catch (e: ReflectiveOperationException) {
+            // best-effort: fall back to mount-time seeding
+        }
+    }
 }
