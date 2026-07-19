@@ -365,6 +365,11 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         val blockState = level.getBlockState(blockPos)
         if (blockState.block !is ShipHelmBlock) return
 
+        // Capture the helm's forward (bow) direction NOW, while the helm is still in the world and ship space is
+        // about to be frozen aligned to world axes. Seeds ShipInfluenceOrientation at ASSEMBLY so the influence-
+        // border faces lock to the helm the instant the ship exists (see the seed call after finishAssembly).
+        val forwardAtAssembly = helmSeatDirection
+
         // Assembly places blocks straight into the shipyard without firing onPlace, so the
         // counters BalloonBlock/FloaterBlock/AnchorBlock/ShipHelmBlock maintain via onPlace
         // would all stay zero on a freshly assembled ship -- leaving it with no buoyancy.
@@ -444,6 +449,13 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         // ship-world tick). Attachments require a LoadedServerShip, so attach
         // EurekaShipControl now if the ship is already loaded, otherwise defer.
         val shipId = builtShip.id
+
+        // Lock the influence-border orientation to the helm's facing at assembly: the Front/Back/Left/Right faces
+        // follow the bow from the moment the ship is created, so the expand/contract commands and the border
+        // wireframe are correct immediately -- no longer wrong until someone sits at the helm. Seeded reflectively
+        // because ShipInfluenceOrientation is a VS2 port addition that isn't on the VS2 API version Eureka compiles
+        // against; the deployed port VS2 jar has it at runtime. On stock VS2 the class is absent and this no-ops.
+        InfluenceOrientationBridge.seedForward(shipId, forwardAtAssembly)
 
         fun applyControl(loadedShip: LoadedServerShip) {
             val control = EurekaShipControl.getOrCreate(loadedShip)
@@ -531,4 +543,34 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         return startRiding(player, force, blockPos, blockState, level as ServerLevel)
     }
     private val logger by logger()
+}
+
+/**
+ * Reflective bridge to VS2's `ShipInfluenceOrientation.observeForward`, which records a ship's forward (bow)
+ * direction so the influence-border faces (Front/Back/Left/Right) follow the helm. That class is a VS2 port
+ * addition that isn't on the VS2 API version Eureka compiles against, so we resolve it reflectively against the
+ * runtime jar (cached after the first call). On stock VS2 the class is absent and [seedForward] is a no-op.
+ */
+private object InfluenceOrientationBridge {
+    private var resolved = false
+    private var instance: Any? = null
+    private var method: java.lang.reflect.Method? = null
+
+    fun seedForward(shipId: Long, forward: Direction) {
+        if (!resolved) {
+            try {
+                val clazz = Class.forName("org.valkyrienskies.mod.common.util.ShipInfluenceOrientation")
+                instance = clazz.getField("INSTANCE").get(null)
+                method = clazz.getMethod("observeForward", java.lang.Long.TYPE, Direction::class.java)
+            } catch (e: ReflectiveOperationException) {
+                method = null // stock VS2: no helm-oriented influence border to seed
+            }
+            resolved = true
+        }
+        try {
+            method?.invoke(instance, shipId, forward)
+        } catch (e: ReflectiveOperationException) {
+            // best-effort: fall back to mount-time seeding (if present)
+        }
+    }
 }
