@@ -35,6 +35,13 @@ class FloaterBlock : Block(
         if (level.isClientSide) return
         level as ServerLevel
 
+        // onPlace also fires for same-block state changes, and neighborChanged below rewrites this
+        // block's own POWER on every redstone edge. Without this guard that rewrite re-counted the
+        // floater on top of the delta neighborChanged had already applied: powering a floater netted
+        // zero, but UN-powering it added a second full-strength floater, so a lever wired to a floater
+        // inflated the ship's buoyancy by 15 per off-cycle, permanently.
+        if (oldState.block == this) return
+
         val floaterPower = 15 - state.getValue(POWER)
 
         val ship = level.getLoadedShipManagingPos(pos) ?: return
