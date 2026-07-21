@@ -4,6 +4,7 @@ import com.mojang.serialization.MapCodec
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.core.particles.ParticleTypes
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.sounds.SoundEvents
 import net.minecraft.sounds.SoundSource
 import net.minecraft.util.RandomSource
@@ -27,9 +28,12 @@ import net.minecraft.world.level.block.state.properties.BlockStateProperties.HOR
 import net.minecraft.world.level.material.MapColor
 import net.minecraft.world.level.redstone.Orientation
 import net.minecraft.world.phys.BlockHitResult
+import org.valkyrienskies.core.api.attachment.getAttachment
 import org.valkyrienskies.eureka.EurekaProperties.HEAT
 import org.valkyrienskies.eureka.blockentity.EngineBlockEntity
+import org.valkyrienskies.eureka.ship.EurekaShipControl
 import org.valkyrienskies.mod.common.blockProps
+import org.valkyrienskies.mod.common.getLoadedShipManagingPos
 
 class EngineBlock : BaseEntityBlock(
     blockProps().mapColor(MapColor.STONE)
@@ -80,6 +84,31 @@ class EngineBlock : BaseEntityBlock(
     // their original world direction after the hull was re-oriented). Mirrors ShipHelmBlock.
     override fun rotate(state: BlockState, rotation: Rotation): BlockState? {
         return state.setValue(HORIZONTAL_FACING, rotation.rotate(state.getValue(HORIZONTAL_FACING) as Direction)) as BlockState
+    }
+
+    // Keep the ship's engine count live. It was only ever captured at assembly
+    // (ShipHelmBlockEntity.assemble), so an engine added or removed afterwards left the count -- and with
+    // it the helm's "Top Speed" estimate, which is derived from it -- stale, while the physics used the
+    // real power the engines actually reported. Balloons and floaters already track themselves this way.
+    override fun onPlace(state: BlockState, level: Level, pos: BlockPos, oldState: BlockState, isMoving: Boolean) {
+        super.onPlace(state, level, pos, oldState, isMoving)
+
+        if (level.isClientSide) return
+        // onPlace also fires for same-block state changes, and this engine rewrites its own HEAT every
+        // few ticks while burning -- without this guard the count would inflate on every heat step.
+        // (affectNeighborsAfterRemoval below needs no such guard: it only fires on real removal.)
+        if (oldState.block == this) return
+
+        val ship = (level as ServerLevel).getLoadedShipManagingPos(pos) ?: return
+        EurekaShipControl.getOrCreate(ship).engines += 1
+    }
+
+    override fun affectNeighborsAfterRemoval(state: BlockState, level: ServerLevel, pos: BlockPos, isMoving: Boolean) {
+        super.affectNeighborsAfterRemoval(state, level, pos, isMoving)
+
+        level.getLoadedShipManagingPos(pos)?.getAttachment<EurekaShipControl>()?.let {
+            it.engines = (it.engines - 1).coerceAtLeast(0)
+        }
     }
 
     // Tell the engine its redstone signal may have changed, so it re-reads instead of polling all six
