@@ -246,7 +246,7 @@ class ShipHelmScreen(handler: ShipHelmScreenMenu, playerInventory: Inventory, te
     // result back). Hidden until wired visible by updateButtons.
     private fun addCruiseBox(bx: Int, by: Int): EditBox =
         addRenderableWidget(EditBox(font, bx, by, CRUISE_BOX_W, CRUISE_BOX_H, Component.empty())).also {
-            it.setMaxLength(7) // e.g. "-28.00" plus headroom, now that values carry two decimals
+            it.setMaxLength(8) // "-28.000" plus headroom, now that values carry three decimals
             it.setBordered(true)
             it.setFilter { s -> s.matches(NUMERIC) }
         }
@@ -380,14 +380,14 @@ class ShipHelmScreen(handler: ShipHelmScreenMenu, playerInventory: Inventory, te
     }
 
     // Show/enable a cruise box and, while it isn't being edited, keep it displaying the live synced value.
-    // The synced value is in hundredths (see ShipHelmScreenMenu) so it renders with two decimals for fine
+    // The synced value is in thousandths (see ShipHelmScreenMenu) so it renders with three decimals for fine
     // tuning; speed tracks the ship's live velocity (HUD-synced), turn/vertical show their locked setpoints.
-    private fun updateCruiseBox(box: EditBox, usable: Boolean, syncedHundredths: Int) {
+    private fun updateCruiseBox(box: EditBox, usable: Boolean, syncedThousandths: Int) {
         box.visible = usable
         box.setEditable(usable)
         // Locale.ROOT so the decimal separator is always '.', matching the box's NUMERIC filter (a locale that
         // formats with ',' would be rejected by the filter and truncate the value).
-        if (usable && !box.isFocused) box.value = String.format(java.util.Locale.ROOT, "%.2f", syncedHundredths / 100.0)
+        if (usable && !box.isFocused) box.value = String.format(java.util.Locale.ROOT, "%.3f", syncedThousandths / 1000.0)
     }
 
     // Assembler "+ N%" box: always visible (matching the checkboxes), editable only when its sub is on. While not
@@ -586,13 +586,17 @@ class ShipHelmScreen(handler: ShipHelmScreenMenu, playerInventory: Inventory, te
 
         private const val COL1_X = 12            // Cruise Control master
         private const val COL1_SUB_X = 16        // Speed/Turn/Vertical checkboxes
-        private const val COL1_BOX_X = 74        // manual value boxes
+        private const val COL1_BOX_X = 72        // manual value boxes
         private const val COL2_X = 120           // Display HUD master
         private const val COL2_SUB_X = 124
         private const val COL3_X = 190           // Eureka Assembler master
         private const val COL3_SUB_X = 194
 
-        private const val CRUISE_BOX_W = 36
+        // Wide enough for a full three-decimal value: "-15.140" is 40px in this font and a bordered EditBox
+        // spends 8 of its width on the frame and left padding. The column is boxed in on both sides -- the
+        // "Vertical:" label ends at COL1_SUB_X + BOX + GAP + 41 = 70, and the HUD sub-checkboxes start at
+        // COL2_SUB_X = 124 -- so 72..120 is very nearly the whole space there is between them.
+        private const val CRUISE_BOX_W = 48
         private const val CRUISE_BOX_H = 12
 
         // Assembler "+ N%" bonus boxes (right-aligned to the panel's right edge) and the read-only weight box.
