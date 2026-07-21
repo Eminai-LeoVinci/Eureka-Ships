@@ -6,12 +6,14 @@ import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.entity.Entity
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.block.Block
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.Rotation
 import net.minecraft.world.level.block.SnowLayerBlock
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.phys.AABB
 import org.joml.AxisAngle4d
 import org.joml.Matrix4d
 import org.joml.Vector3d
@@ -144,6 +146,36 @@ object ShipAssembler {
 
         val alloc0 = Vector3d()
 
+        // Every block below is written to floor(its world center), so a ship sitting at any sub-block offset --
+        // which is every ship that hasn't come to rest exactly on the grid -- has its whole structure snapped to
+        // the block grid on the way out, moving it by up to half a block on each axis. The entities standing on
+        // it are not part of that write. When the deck rises into a player's feet it leaves them embedded in it:
+        // never on ground (so no jump, and mining runs at the airborne penalty), every neighbouring block at foot
+        // level is deck too, and the server keeps correcting the client's attempt to fall out -- the rapid bob.
+        // Relogging can't clear it, because the position genuinely is inside the block. So carry whatever was
+        // riding the ship by the same offset the blocks take.
+        //
+        // Measured off the helm, which is one of this ship's own blocks and so goes through exactly the math the
+        // loop applies. A 90-degree rotation maps the block lattice onto itself, so every block of the ship
+        // shares the helm's fractional offset -- one vector describes the whole move.
+        val gridOffset = shipToWorld
+            .transformPosition(Vector3d(shipCenter.x + 0.5, shipCenter.y + 0.5, shipCenter.z + 0.5))
+            .let { Vector3d(floor(it.x) + 0.5 - it.x, floor(it.y) + 0.5 - it.y, floor(it.z) + 0.5 - it.z) }
+
+        // Captured BEFORE the relocation: the block updates it triggers can spawn entities of their own (falling
+        // sand off a column that just lost its support), and those already appear at their final position. The
+        // query box is deliberately generous -- worldAABB is the hull, and someone standing on deck is a hair
+        // outside it -- with the destination check below, not the box, keeping bystanders out of the move.
+        val worldToShip = ship.transform.worldToShip
+        val footprint = ship.worldAABB
+        val riders = level.getEntities(
+            null as Entity?,
+            AABB(
+                footprint.minX() - 1.0, footprint.minY() - 1.0, footprint.minZ() - 1.0,
+                footprint.maxX() + 1.0, footprint.maxY() + 1.0, footprint.maxZ() + 1.0
+            )
+        ).filter { !it.isPassenger }
+
         val chunksToBeUpdated = mutableMapOf<ChunkPos, Pair<ChunkPos, ChunkPos>>()
 
         ship.activeChunksSet.forEach { chunkX, chunkZ ->
@@ -199,6 +231,22 @@ object ShipAssembler {
         // We update the blocks after they're set to prevent blocks from breaking
         for (triple in toUpdate) {
             updateBlock(level, triple.first, triple.second, triple.third)
+        }
+
+        // The world blocks exist again: put the riders back where the structure carried them. A ship-space round
+        // trip rather than a plain translate, so the rotation snap (up to the helm's disassemble threshold of
+        // yaw) turns them with the hull instead of leaving them offset from it.
+        val alloc1 = Vector3d()
+        for (entity in riders) {
+            if (entity.isRemoved) continue
+            val to = shipToWorld
+                .transformPosition(worldToShip.transformPosition(alloc1.set(entity.x, entity.y, entity.z)))
+                .add(gridOffset)
+            val moved = entity.boundingBox.move(to.x - entity.x, to.y - entity.y, to.z - entity.z)
+            // A destination inside a block means this was never riding the ship -- a bystander standing against
+            // the hull, caught by the generous query box. Leave it be; where it already is, is free.
+            if (level.getBlockCollisions(entity, moved).iterator().hasNext()) continue
+            entity.teleportTo(to.x, to.y, to.z)
         }
 
         level.server.executeIf(
