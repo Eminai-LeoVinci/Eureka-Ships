@@ -275,7 +275,15 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         // altitude hold engage on man-made / elevated water bodies, not just the ocean at sea level.
         val sLevel = level
         if (curControl != null && curShip != null && sLevel is ServerLevel) {
-            curControl.keelInWater = sampleKeelInWater(sLevel, curShip)
+            // ~36 fluid reads per helm per tick, so only pay for them when something consumes the
+            // answer, and then only every 4th tick. Staggered by block position so a fleet of helms
+            // doesn't sample on the same tick. The hold's own hysteresis (engage on contact, release
+            // only on a full clear -- see EurekaShipControl) absorbs a verdict up to 0.2s stale.
+            if (!EurekaConfig.SERVER.enableWaterAltitudeHold) {
+                curControl.keelInWater = false
+            } else if (sLevel.gameTime and 3L == (blockPos.hashCode() and 3).toLong()) {
+                curControl.keelInWater = sampleKeelInWater(sLevel, curShip)
+            }
             // Measure per-axis input-hold time on the fixed-rate game thread (physics TPS is variable) so the
             // physics turn law can gate the acceleration phase and all three sets can do hold-to-cancel.
             val seat = curShip.getAttachment(SeatedControllingPlayer::class.java)

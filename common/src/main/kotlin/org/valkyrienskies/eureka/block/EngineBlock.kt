@@ -25,6 +25,7 @@ import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.StateDefinition
 import net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING
 import net.minecraft.world.level.material.MapColor
+import net.minecraft.world.level.redstone.Orientation
 import net.minecraft.world.phys.BlockHitResult
 import org.valkyrienskies.eureka.EurekaProperties.HEAT
 import org.valkyrienskies.eureka.blockentity.EngineBlockEntity
@@ -79,6 +80,22 @@ class EngineBlock : BaseEntityBlock(
     // their original world direction after the hull was re-oriented). Mirrors ShipHelmBlock.
     override fun rotate(state: BlockState, rotation: Rotation): BlockState? {
         return state.setValue(HORIZONTAL_FACING, rotation.rotate(state.getValue(HORIZONTAL_FACING) as Direction)) as BlockState
+    }
+
+    // Tell the engine its redstone signal may have changed, so it re-reads instead of polling all six
+    // neighbours every tick. Mirrors how AnchorBlock reacts to redstone.
+    override fun neighborChanged(
+        state: BlockState,
+        level: Level,
+        pos: BlockPos,
+        block: Block,
+        orientation: Orientation?,
+        isMoving: Boolean
+    ) {
+        if (!level.isClientSide) {
+            (level.getBlockEntity(pos) as? EngineBlockEntity)?.markRedstoneDirty()
+        }
+        super.neighborChanged(state, level, pos, block, orientation, isMoving)
     }
 
     override fun getRenderShape(blockState: BlockState): RenderShape {

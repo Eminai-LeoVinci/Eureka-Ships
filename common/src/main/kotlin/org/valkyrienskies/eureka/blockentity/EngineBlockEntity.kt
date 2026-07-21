@@ -56,6 +56,28 @@ class EngineBlockEntity(pos: BlockPos, state: BlockState) :
         }
     }
 
+    // Redstone signal, refreshed on neighbour changes rather than polled. hasNeighborSignal reads all
+    // six neighbouring block states, and it did so for every engine on every ship every tick even
+    // though the answer only changes when a neighbour does. EngineBlock.neighborChanged marks it
+    // stale; the periodic re-read is a safety net for anything that powers the block without sending
+    // a neighbour update (and re-syncs after load, assembly or a shipyard relocation).
+    private var redstoneSignal = false
+    private var redstoneCheckedAtTick = Long.MIN_VALUE
+
+    fun markRedstoneDirty() {
+        redstoneCheckedAtTick = Long.MIN_VALUE
+    }
+
+    private fun hasRedstoneSignal(): Boolean {
+        val level = this.level!!
+        val gameTime = level.gameTime
+        if (gameTime - redstoneCheckedAtTick >= REDSTONE_RESYNC_INTERVAL_TICKS) {
+            redstoneSignal = level.hasNeighborSignal(blockPos)
+            redstoneCheckedAtTick = gameTime
+        }
+        return redstoneSignal
+    }
+
     private var heat = 0f
     fun tick() {
         if (this.level!!.isClientSide) return
@@ -73,7 +95,7 @@ class EngineBlockEntity(pos: BlockPos, state: BlockState) :
         // tracks the same vanilla/advanced gain used below; was a stale construction-time field.
         val maxEffectiveFuel = 100f - engineCfg.engineHeatGain
 
-        val isPowered = level!!.hasNeighborSignal(blockPos)
+        val isPowered = hasRedstoneSignal()
         if (EurekaConfig.SERVER.engineRedstoneBehaviorPause && isPowered) {
             // Still report the tank level while redstone-paused, so a fueled-but-idle engine keeps counting
             // toward the helm "Engine Power: X%" readout instead of dropping to 0.
@@ -290,4 +312,8 @@ class EngineBlockEntity(pos: BlockPos, state: BlockState) :
     }
 
     // endregion Container Stuff
+
+    companion object {
+        private const val REDSTONE_RESYNC_INTERVAL_TICKS = 20L
+    }
 }
