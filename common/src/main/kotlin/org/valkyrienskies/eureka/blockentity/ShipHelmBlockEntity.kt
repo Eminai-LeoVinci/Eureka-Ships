@@ -60,8 +60,16 @@ import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+// Blocks that never assemble, full stop: fluids, portals, and the world's own guard blocks.
 val ASSEMBLE_BLACKLIST: TagKey<Block> =
     TagKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath(EurekaMod.MOD_ID, "assemble_blacklist"))
+
+// Blocks the WORLD is made of -- stone, dirt, sand, ice, vegetation. These are neither banned nor free:
+// whether one assembles depends on whether the patch it belongs to is a player's build or the landscape,
+// which ShipAssembler.TerrainPocketClassifier decides by extent (a deck ends; a beach doesn't). This is
+// what keeps a ship from swallowing the hillside next to it while still letting a grass-decked raft fly.
+val ASSEMBLE_TERRAIN: TagKey<Block> =
+    TagKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath(EurekaMod.MOD_ID, "assemble_terrain"))
 
 private const val ORPHAN_SCAN_INTERVAL_TICKS = 20
 
@@ -390,13 +398,29 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         var activeAnchorCount = 0
         var engineCount = 0
         var blockCount = 0 // total non-air assembled blocks (block entities like chests count too)
+
+        // What assembles: everything a player could have placed. Air never; the config blockBlacklist and
+        // the assemble_blacklist tag never (fluids, portals, world-guard blocks); and terrain-type blocks
+        // (the assemble_terrain tag) exactly when the patch they belong to is small enough to be a build
+        // rather than the landscape -- see TerrainPocketClassifier for how that inference works and where
+        // it can be wrong. Verdicts are cached in the classifier for the duration of this one assembly.
+        val terrain = ShipAssembler.TerrainPocketClassifier(
+            level, EurekaConfig.SERVER.terrainPocketMaxBlocks
+        ) { state ->
+            !state.isAir && state.`is`(ASSEMBLE_TERRAIN) && !state.`is`(ASSEMBLE_BLACKLIST) &&
+                !EurekaConfig.SERVER.blockBlacklist.contains(BuiltInRegistries.BLOCK.getKey(state.block).toString())
+        }
         val blockPositions = ShipAssembler.collectBlockPositions(
             level,
             blockPos
-        ) {
-            val allowed = !it.isAir && !it.`is`(ASSEMBLE_BLACKLIST) &&
-            // TODO: Remove blockBlacklist
-            !(EurekaConfig.SERVER.blockBlacklist.isNotEmpty() && EurekaConfig.SERVER.blockBlacklist.contains(BuiltInRegistries.BLOCK.getKey(it.block).toString()))
+        ) { pos, it ->
+            val allowed = when {
+                it.isAir -> false
+                EurekaConfig.SERVER.blockBlacklist.contains(BuiltInRegistries.BLOCK.getKey(it.block).toString()) -> false
+                it.`is`(ASSEMBLE_BLACKLIST) -> false
+                it.`is`(ASSEMBLE_TERRAIN) -> terrain.isBoundedPocket(pos)
+                else -> true
+            }
             if (allowed) {
                 blockCount++
                 when (it.block) {

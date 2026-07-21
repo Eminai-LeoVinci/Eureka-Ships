@@ -1,5 +1,6 @@
 package org.valkyrienskies.eureka
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.mojang.logging.LogUtils
@@ -27,6 +28,10 @@ object EurekaConfigLoader {
 
     private val mapper: ObjectMapper = ObjectMapper().apply {
         enable(SerializationFeature.INDENT_OUTPUT)
+        // A file written by a NEWER build may carry fields this build has dropped. Without this, one such
+        // key fails the whole parse and the entire config silently reverts to defaults -- far worse than
+        // ignoring the key. The re-serialize after load drops obsolete keys from the file anyway.
+        disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
     }
 
     @JvmStatic
