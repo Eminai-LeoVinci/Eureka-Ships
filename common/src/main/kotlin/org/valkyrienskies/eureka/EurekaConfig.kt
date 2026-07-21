@@ -13,8 +13,9 @@ object EurekaConfig {
     // mode-affected physics off of (see EurekaShipControl.cfg and EurekaShipControl.engineCfg, the latter read
     // by EngineBlockEntity for per-ship engine force/heat).
     //
-    // maxShipBlocks and blockBlacklist stay GLOBAL: both are consumed at ASSEMBLY time (ShipHelmBlockEntity),
-    // where no ship -- and therefore no per-ship mode -- exists yet, so they CANNOT be per-ship. They are
+    // maxShipBlocks, blockBlacklist and terrainPocketMaxBlocks stay GLOBAL: all are consumed at ASSEMBLY
+    // time (ShipHelmBlockEntity), where no ship -- and therefore no per-ship mode -- exists yet, so they
+    // CANNOT be per-ship. Editing the "serverVanilla" copies of them does nothing. They are
     // deliberately NOT overridden here; the only knobs that matter live on EurekaConfig.SERVER (=== ADVANCED).
     @JvmField
     val ADVANCED = Server()
@@ -299,13 +300,23 @@ object EurekaConfig {
         @JsonSchema(description = "Maximum number of blocks allowed in a ship. Set to 0 for no limit")
         var maxShipBlocks = 50000
 
-        // TODO: Remove blockBlacklist
-        // Blacklist of blocks that don't get added for ship building
-        @JsonSchema(description = "Blacklist of blocks that don't get assembled (Use Block Tag instead)")
+        @JsonSchema(description = "Blocks that never assemble, on top of the vs_eureka:assemble_blacklist block tag (fluids, portals, world-guard blocks). Absolute -- nothing overrides an entry here.")
         var blockBlacklist : Set<String> = setOf(
-            "minecraft:water", "minecraft:sand", "minecraft:gravel", "minecraft:lava", "minecraft:fire",
-            "minecraft:bedrock"
+            "minecraft:water", "minecraft:lava", "minecraft:fire", "minecraft:bedrock"
         )
+
+        @JsonSchema(
+            description = "How large a connected patch of natural-terrain-type blocks (the " +
+                "vs_eureka:assemble_terrain block tag: stone, dirt, sand, ice, vegetation...) can be and still " +
+                "assemble as part of the ship. Minecraft records nothing about who placed a block, so player " +
+                "builds are told apart from the landscape by extent: a grass deck is a bounded pocket, a beach " +
+                "goes on past any budget. A patch that stays within this many blocks sails with the ship; a " +
+                "patch that exceeds it is the world and stays. The trade-off runs both ways -- a natural islet " +
+                "smaller than this reads as a build and will be taken if the hull touches it, and a deck that " +
+                "physically touches the shore reads as the world and stays behind. 0 disables terrain assembly " +
+                "entirely (the old behavior: these blocks never assemble)."
+        )
+        var terrainPocketMaxBlocks = 4096
 
         @JsonSchema(description = "Dev: action-bar a message each time a per-set cruise HOLD-cancel fires (Horizontal/Vertical/Turn). Read globally off EurekaConfig.SERVER; toggle in-game with /vs cruise-cancel-debug <bool>.")
         var debugCruiseCancel = false

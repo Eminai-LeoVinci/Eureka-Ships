@@ -1,6 +1,7 @@
 package org.valkyrienskies.eureka.util
 
 import com.google.common.collect.Sets
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import it.unimi.dsi.fastutil.objects.ObjectArrayList
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
@@ -35,7 +36,7 @@ object ShipAssembler {
     // BFS-collect the connected block set (world coordinates) that would become a ship, or null if it
     // exceeds maxShipBlocks. Deliberately does NOT clear snow or create the ship, so a caller can inspect
     // (and, for the Eureka Assembler, mutate) the world set and still abort cleanly before anything is built.
-    fun collectBlockPositions(level: ServerLevel, center: BlockPos, predicate: (BlockState) -> Boolean): HashSet<BlockPos>? {
+    fun collectBlockPositions(level: ServerLevel, center: BlockPos, predicate: (BlockPos, BlockState) -> Boolean): HashSet<BlockPos>? {
         val blocks = DenseBlockPosSet()
 
         blocks.add(center.toJOML())
@@ -57,7 +58,7 @@ object ShipAssembler {
 
     // Back-compat one-shot collect-then-assemble (no pre-assembly hook). Kept for any external callers;
     // the helm now drives the two steps directly so it can run the Eureka Assembler in between.
-    fun collectBlocks(level: ServerLevel, center: BlockPos, predicate: (BlockState) -> Boolean): ServerShip? =
+    fun collectBlocks(level: ServerLevel, center: BlockPos, predicate: (BlockPos, BlockState) -> Boolean): ServerShip? =
         collectBlockPositions(level, center, predicate)?.let { finishAssembly(level, it) }
 
     // Snow layers (minecraft:snow) are in the assemble_blacklist, so they're never collected into the
@@ -220,7 +221,7 @@ object ShipAssembler {
         level: ServerLevel,
         start: BlockPos,
         blocks: DenseBlockPosSet,
-        predicate: (BlockState) -> Boolean
+        predicate: (BlockPos, BlockState) -> Boolean
     ): Boolean {
 
         val blacklist = DenseBlockPosSet()
@@ -242,7 +243,7 @@ object ShipAssembler {
         while (!stack.isEmpty) {
             val pos = stack.pop()
 
-            if (predicate(level.getBlockState(pos))) {
+            if (predicate(pos, level.getBlockState(pos))) {
                 blocks.add(pos.x, pos.y, pos.z)
                 directions(pos) {
                     if (!blacklist.contains(it.x, it.y, it.z)) {
@@ -260,6 +261,62 @@ object ShipAssembler {
             logger.info("Assembled ship with ${blocks.size} blocks, out of ${EurekaConfig.SERVER.maxShipBlocks} allowed")
         }
         return true
+    }
+
+    // Decides whether a patch of terrain-type blocks is part of a player's build or part of the world.
+    //
+    // Minecraft keeps no record of who placed a block -- a grass block in a hill and a grass block laid as
+    // a ship's deck are the same value in the same chunk array -- so origin cannot be looked up; it has to
+    // be inferred. What does distinguish a build from the landscape is EXTENT. A deck is a pocket of at
+    // most a few thousand blocks sealed in by hull and air; a beach or a hillside just keeps going. So
+    // when assembly meets a block of a terrain-type kind (the vs_eureka:assemble_terrain tag) it floods
+    // outward through terrain-type blocks alone and asks whether the patch ENDS. Ends within the budget:
+    // it is a build, and the whole patch sails. Still going when the budget runs out: it is the world, and
+    // the whole patch stays. Air, hull blocks and blacklisted blocks bound the flood on every side.
+    //
+    // The honest limits of the inference: a genuinely tiny landform -- a sand islet smaller than the
+    // budget -- reads as a build, so a ship parked touching one will take it. And a deck that physically
+    // touches the shore reads as the world, so it stays behind exactly as it would have before. Both
+    // resolve the moment the ship isn't parked against the thing it's being confused with.
+    //
+    // Verdicts are cached per assembly, and a flood that runs into an already-rejected patch rejects
+    // immediately -- it has just proven it is connected to the same landmass.
+    class TerrainPocketClassifier(
+        private val level: ServerLevel,
+        private val budget: Int,
+        private val walkable: (BlockState) -> Boolean,
+    ) {
+        private val accepted = LongOpenHashSet()
+        private val rejected = LongOpenHashSet()
+
+        fun isBoundedPocket(start: BlockPos): Boolean {
+            val startKey = start.asLong()
+            if (accepted.contains(startKey)) return true
+            if (rejected.contains(startKey)) return false
+            if (budget <= 0) return false // 0 restores the old behavior: terrain-type blocks never assemble
+
+            val region = LongOpenHashSet()
+            val stack = ObjectArrayList<BlockPos>()
+            region.add(startKey)
+            stack.push(start)
+            var bounded = true
+            while (bounded && !stack.isEmpty) {
+                val pos = stack.pop()
+                directions(pos) {
+                    val key = it.asLong()
+                    if (bounded && !region.contains(key)) {
+                        if (rejected.contains(key)) {
+                            bounded = false // joined a patch already proven to be the landmass
+                        } else if (walkable(level.getBlockState(it))) {
+                            region.add(key)
+                            if (region.size > budget) bounded = false else stack.push(it)
+                        }
+                    }
+                }
+            }
+            if (bounded) accepted.addAll(region) else rejected.addAll(region)
+            return bounded
+        }
     }
 
     private fun directions(center: BlockPos, lambda: (BlockPos) -> Unit) {
