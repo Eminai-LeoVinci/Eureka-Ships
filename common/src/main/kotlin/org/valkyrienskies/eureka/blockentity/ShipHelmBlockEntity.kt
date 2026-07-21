@@ -4,6 +4,7 @@ import net.minecraft.commands.arguments.EntityAnchorArgument
 import net.minecraft.core.BlockPos
 import net.minecraft.core.Direction
 import net.minecraft.core.Direction.Axis
+import net.minecraft.core.registries.BuiltInRegistries
 import net.minecraft.core.registries.Registries
 import net.minecraft.network.chat.Component
 import net.minecraft.resources.ResourceLocation
@@ -55,8 +56,18 @@ import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+// Blocks that never assemble, full stop: fluids, portals, and the world's own guard blocks.
  var ASSEMBLE_BLACKLIST: TagKey<Block> =
      TagKey.create(Registries.BLOCK, ResourceLocation(EurekaMod.MOD_ID, "assemble_blacklist"))
+
+// Blocks the WORLD is made of -- stone, dirt, sand, ice, vegetation. These are neither banned nor free:
+// whether one assembles depends on whether the patch it belongs to is a player's build or the landscape,
+// which ShipAssembler.TerrainPocketClassifier decides by extent (a deck ends; a beach doesn't). This is
+// what keeps a ship from swallowing the hillside next to it while still letting a grass-decked raft fly.
+// (Note: before this, the config blockBlacklist was never read on this version at all -- the assembly
+// predicate consulted the tag alone. It is honoured now, same as on 1.21.x.)
+val ASSEMBLE_TERRAIN: TagKey<Block> =
+    TagKey.create(Registries.BLOCK, ResourceLocation(EurekaMod.MOD_ID, "assemble_terrain"))
 
 // Keep-active accessor cache. VS2's ShipSettings.keepActive exists on OUR custom VS2 but NOT on the official
 // VS2 2.4.10 this one Eureka jar is compiled against (one-jar strategy: the jar loads on both), so the flag is
@@ -349,10 +360,30 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
 
         // Collect the connected block set WITHOUT building the ship yet, so the Eureka Assembler can swap
         // hull blocks (and abort cleanly) before anything is committed to a ship.
+        //
+        // What assembles: everything a player could have placed. Air never; the config blockBlacklist and
+        // the assemble_blacklist tag never (fluids, portals, world-guard blocks); and terrain-type blocks
+        // (the assemble_terrain tag) exactly when the patch they belong to is small enough to be a build
+        // rather than the landscape -- see TerrainPocketClassifier for how that inference works and where
+        // it can be wrong. Verdicts are cached in the classifier for the duration of this one assembly.
+        val terrain = ShipAssembler.TerrainPocketClassifier(
+            level, EurekaConfig.SERVER.terrainPocketMaxBlocks
+        ) { state ->
+            !state.isAir && state.`is`(ASSEMBLE_TERRAIN) && !state.`is`(ASSEMBLE_BLACKLIST) &&
+                !EurekaConfig.SERVER.blockBlacklist.contains(BuiltInRegistries.BLOCK.getKey(state.block).toString())
+        }
         val blockPositions = ShipAssembler.collectBlockPositions(
             level,
             blockPos
-        ) { !it.isAir && !it.`is`(ASSEMBLE_BLACKLIST) }
+        ) { pos, it ->
+            when {
+                it.isAir -> false
+                EurekaConfig.SERVER.blockBlacklist.contains(BuiltInRegistries.BLOCK.getKey(it.block).toString()) -> false
+                it.`is`(ASSEMBLE_BLACKLIST) -> false
+                it.`is`(ASSEMBLE_TERRAIN) -> terrain.isBoundedPocket(pos)
+                else -> true
+            }
+        }
 
         if (blockPositions == null) {
             player.displayClientMessage(Component.translatable("info.vs_eureka.too_big", EurekaConfig.SERVER.maxShipBlocks), true)
