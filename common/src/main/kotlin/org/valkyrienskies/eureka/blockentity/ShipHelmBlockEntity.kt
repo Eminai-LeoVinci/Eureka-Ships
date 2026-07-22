@@ -501,6 +501,9 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
                     // applyControl below writes onto EurekaShipControl (floaters are stored in fifteenths).
                     floaterCount += outcome.floatersPlaced * 15
                     balloonCount += outcome.balloonsPlaced
+                    // Report the swap in chat (overlay=false) like the cancel paths, so it survives in the
+                    // scrollback. In creative nothing leaves the inventory, so this is the only feedback.
+                    player.displayClientMessage(EurekaAssembler.placementSummary(outcome), false)
                     // The manual % boxes are per-assembly: reset them now that a ship was built (syncs 0% back).
                     AssemblerPreferences.clearBonuses(player.uuid)
                 }
