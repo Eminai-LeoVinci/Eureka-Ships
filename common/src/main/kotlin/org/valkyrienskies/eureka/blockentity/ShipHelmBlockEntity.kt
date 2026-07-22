@@ -137,11 +137,12 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
     val cruiseSpeedArmed: Boolean get() = control?.cruiseHorizontalArmed ?: false
     val cruiseTurnArmed: Boolean get() = control?.cruiseTurnArmed ?: false
     val cruiseVerticalArmed: Boolean get() = control?.cruiseVerticalArmed ?: false
-    // Hundredths of a unit (value * 100) so the helm can show two decimals over the 16-bit DataSlot; the client
-    // divides by 100. Speed (~±30), turn (~±16 deg/s) and vertical (~±10) all fit a signed short once scaled.
-    val cruiseSpeedHundredths: Int get() = ((control?.cruiseSpeedMps() ?: 0.0) * 100.0).roundToInt()
-    val cruiseTurnHundredths: Int get() = ((control?.cruiseTurnDegPerSec() ?: 0.0) * 100.0).roundToInt()
-    val cruiseVerticalHundredths: Int get() = ((control?.cruiseVerticalMps() ?: 0.0) * 100.0).roundToInt()
+    // Thousandths of a unit (value * 1000) so the helm can show three decimals; the client divides by 1000.
+    // A turn especially wants that third place -- a tenth of a degree per second is a visibly different
+    // circle. Scaled this far the values outgrow the 16-bit DataSlot, so the menu splits each across two.
+    val cruiseSpeedThousandths: Int get() = ((control?.cruiseSpeedMps() ?: 0.0) * 1000.0).roundToInt()
+    val cruiseTurnThousandths: Int get() = ((control?.cruiseTurnDegPerSec() ?: 0.0) * 1000.0).roundToInt()
+    val cruiseVerticalThousandths: Int get() = ((control?.cruiseVerticalMps() ?: 0.0) * 1000.0).roundToInt()
     // The forward a helm-menu cruise thrusts along when nobody is seated. A seated pilot's forward is
     // seat.direction.opposite (VSGamePackets), and the helm seat faces this block's HORIZONTAL_FACING, so the
     // matching seat direction is facing.opposite -- passed into the cruise bridge so a menu-activated cruise has
@@ -315,7 +316,15 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
         // altitude hold engage on man-made / elevated water bodies, not just the ocean at sea level.
         val sLevel = level
         if (curControl != null && curShip != null && sLevel is ServerLevel) {
-            curControl.keelInWater = sampleKeelInWater(sLevel, curShip)
+            // ~36 fluid reads per helm per tick, so only pay for them when something consumes the
+            // answer, and then only every 4th tick. Staggered by block position so a fleet of helms
+            // doesn't sample on the same tick. The hold's own hysteresis (engage on contact, release
+            // only on a full clear -- see EurekaShipControl) absorbs a verdict up to 0.2s stale.
+            if (!EurekaConfig.SERVER.enableWaterAltitudeHold) {
+                curControl.keelInWater = false
+            } else if (sLevel.gameTime and 3L == (blockPos.hashCode() and 3).toLong()) {
+                curControl.keelInWater = sampleKeelInWater(sLevel, curShip)
+            }
             // Measure per-axis input-hold time on the fixed-rate game thread (physics TPS is variable) so the
             // physics turn law can gate the acceleration phase and all three sets can do hold-to-cancel.
             val seat = curShip.getAttachment(SeatedControllingPlayer::class.java)

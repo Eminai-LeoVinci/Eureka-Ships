@@ -26,7 +26,7 @@ object EurekaConfig {
         engineHeatGain = 0.03f
         engineBoost = 0.2
         engineBoostOffset = 2.5
-        maxReverseSpeedFromEngines = 8.0
+        maxReverseSpeedFromEngines = 24.0 // real m/s; was 8.0 back when the physics tripled it
         baseImpulseElevationRate = 2.0
         baseImpulseDescendRate = 4.0
         // The ADVANCED turn defaults were retuned to 0.75 / 6.0; pin the original 833d445 values here so
@@ -47,13 +47,13 @@ object EurekaConfig {
         var displayHud = true
 
         @JsonSchema(description = "Show the piloted ship's speed as small text at the top-center of the screen.")
-        var displaySpeed = true
+        var displaySpeed = false
 
         @JsonSchema(description = "Show the piloted ship's altitude (Y) at the top-center of the screen.")
-        var displayAltitude = true
+        var displayAltitude = false
 
         @JsonSchema(description = "Show the piloted ship's compass heading at the top-center of the screen.")
-        var displayHeading = true
+        var displayHeading = false
     }
 
     class Server {
@@ -103,11 +103,13 @@ object EurekaConfig {
         @JsonSchema(description = "The final linear boost will be raised to the power of 2, and the result of the delta is multiple by this value")
         var engineBoostExponentialPower = 0.000001
 
-        @JsonSchema(description = "Max speed of a ship with engines (actual max speed varies with engines and mass.)")
-        var maxSpeedFromEngines = 24.0
+        // These are real m/s now. They used to be tripled by baseSpeed on the way into the physics, so the
+        // old 24.0/12.0 delivered ~72/~36; the defaults are raised to match, leaving ship speeds unchanged.
+        @JsonSchema(description = "Max speed in m/s of a ship with engines (actual max speed varies with engines and mass.)")
+        var maxSpeedFromEngines = 70.0
 
-        @JsonSchema(description = "Max reverse speed of a ship with engines")
-        var maxReverseSpeedFromEngines = 12.0
+        @JsonSchema(description = "Max reverse speed in m/s of a ship with engines")
+        var maxReverseSpeedFromEngines = 36.0
 
         @JsonSchema(description = "The speed at which the ship stabilizes")
         var stabilizationSpeed = 10.0
