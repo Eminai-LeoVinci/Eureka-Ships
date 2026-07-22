@@ -39,9 +39,10 @@ import kotlin.math.min
  *  - both: balloons sized for flight + floaters sized for the resting waterline; Eureka's water
  *    altitude-hold then pins the keel at the surface until the ship flies.
  *
- * Nothing is free: the player must have the required floater/balloon items in inventory or the whole
- * assembly is cancelled with a chat message (kept in the chat history, press T) so the player can read
- * the full multi-line shortfall detail. Counts are solved against the ship's FINAL
+ * Nothing is free in survival: the player must have the required floater/balloon items in inventory or the
+ * whole assembly is cancelled with a chat message (kept in the chat history, press T) so the player can read
+ * the full multi-line shortfall detail. In CREATIVE the items are drawn from the game's infinite supply and
+ * nothing is consumed, the same way placing a block by hand is free there. Counts are solved against the ship's FINAL
  * post-swap mass (each replacement changes the total), using the exact thresholds from
  * [org.valkyrienskies.eureka.command.ShipWeightCommand] so /vs get-ship-weight agrees with what the
  * assembler builds. Block masses are read live from [BlockStateInfo], so pack rebalances are honored.
@@ -68,7 +69,7 @@ object EurekaAssembler {
 
     sealed interface Outcome
     class Cancelled(val message: Component) : Outcome
-    class Applied(val floatersPlaced: Int, val balloonsPlaced: Int) : Outcome
+    class Applied(val floatersPlaced: Int, val balloonsPlaced: Int, val fromCreative: Boolean) : Outcome
 
     private fun massOf(state: BlockState): Double = BlockStateInfo.get(state)?.first ?: 0.0
 
@@ -242,17 +243,25 @@ object EurekaAssembler {
         val neededByBalloon = LinkedHashMap<Block, Int>()
         for ((_, target) in balloonPlacements) neededByBalloon.merge(target, 1, Int::plus)
 
+        // Creative draws the floaters and balloons from the game's infinite supply, the same way placing a
+        // block by hand is free there, so both the inventory gate below and the consumption further down are
+        // skipped. The BLOCK-availability check above still applies either way -- creative hands out items,
+        // not more hull to convert, so a ship without enough whitelisted blocks is still cancelled.
+        val creative = player.abilities.instabuild
+
         // Not enough items in the player's inventory -> abort before touching anything. Balloons are
         // matched per color, so each color is checked against its own item count.
         val inv = player.inventory
-        val haveF = if (floaterMode) countMatching(inv) { isFloaterItem(it) } else 0
-        val balloonShort = LinkedHashMap<Block, Pair<Int, Int>>()
-        for ((target, need) in neededByBalloon) {
-            val have = countMatching(inv) { isSpecificBalloonItem(it, target) }
-            if (need > have) balloonShort[target] = need to have
-        }
-        if ((floaterMode && needF > haveF) || balloonShort.isNotEmpty()) {
-            return Cancelled(inventoryShortfall(floaterMode, needF, haveF, balloonShort))
+        if (!creative) {
+            val haveF = if (floaterMode) countMatching(inv) { isFloaterItem(it) } else 0
+            val balloonShort = LinkedHashMap<Block, Pair<Int, Int>>()
+            for ((target, need) in neededByBalloon) {
+                val have = countMatching(inv) { isSpecificBalloonItem(it, target) }
+                if (need > have) balloonShort[target] = need to have
+            }
+            if ((floaterMode && needF > haveF) || balloonShort.isNotEmpty()) {
+                return Cancelled(inventoryShortfall(floaterMode, needF, haveF, balloonShort))
+            }
         }
 
         // Commit: swap the chosen blocks, then consume the items. onPlace is a no-op here (the block is
@@ -263,10 +272,13 @@ object EurekaAssembler {
         for ((pos, target) in balloonPlacements) {
             level.setBlock(pos, target.defaultBlockState(), Block.UPDATE_CLIENTS)
         }
+        // Creative pays nothing, so changedSlots stays empty and the re-sync below no-ops.
         val changedSlots = ArrayList<Int>(needF + needB)
-        if (needF > 0) consumeMatching(inv, needF, changedSlots) { isFloaterItem(it) }
-        for ((target, need) in neededByBalloon) {
-            consumeMatching(inv, need, changedSlots) { isSpecificBalloonItem(it, target) }
+        if (!creative) {
+            if (needF > 0) consumeMatching(inv, needF, changedSlots) { isFloaterItem(it) }
+            for ((target, need) in neededByBalloon) {
+                consumeMatching(inv, need, changedSlots) { isSpecificBalloonItem(it, target) }
+            }
         }
         if (changedSlots.isNotEmpty() && player is ServerPlayer) {
             // Keep the server's inventoryMenu snapshot in step with the real inventory...
@@ -283,8 +295,36 @@ object EurekaAssembler {
             }
         }
 
-        return Applied(needF, needB)
+        return Applied(needF, needB, creative)
     }
+
+    /**
+     * Chat summary of what the assembler swapped in. Worth saying out loud because the swap happens to the
+     * hull rather than to anything the player is looking at: in survival the inventory is the only other
+     * signal, and in creative nothing is consumed at all, so without this the assembler is silent.
+     */
+    fun placementSummary(outcome: Applied): Component {
+        val parts = ArrayList<String>(2)
+        if (outcome.floatersPlaced > 0) parts.add("${outcome.floatersPlaced} ${plural(outcome.floatersPlaced, "floater")}")
+        if (outcome.balloonsPlaced > 0) parts.add("${outcome.balloonsPlaced} ${plural(outcome.balloonsPlaced, "balloon")}")
+
+        val msg = Component.literal("Eureka Assembler").withStyle(ChatFormatting.AQUA, ChatFormatting.BOLD)
+        if (parts.isEmpty()) {
+            // The ship already met both targets, so nothing was swapped. Say so rather than nothing at all,
+            // otherwise an enabled assembler looks broken when it was simply not needed.
+            msg.append(
+                Component.literal(" -- already had enough; nothing placed").withStyle(ChatFormatting.GRAY)
+            )
+            return msg
+        }
+        msg.append(Component.literal(" -- placed ${parts.joinToString(" and ")}").withStyle(ChatFormatting.GREEN))
+        if (outcome.fromCreative) {
+            msg.append(Component.literal(" (Creative: no materials used)").withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC))
+        }
+        return msg
+    }
+
+    private fun plural(n: Int, word: String): String = if (n == 1) word else "${word}s"
 
     private fun isFloaterItem(stack: ItemStack): Boolean {
         val item = stack.item

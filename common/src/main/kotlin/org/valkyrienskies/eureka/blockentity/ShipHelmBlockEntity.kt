@@ -443,6 +443,9 @@ class ShipHelmBlockEntity(pos: BlockPos, state: BlockState) :
                 is EurekaAssembler.Applied -> {
                     // The freshly-placed floaters/balloons are counted by their own onPlace when the assembly
                     // relocation fires (1.20.1), so there is nothing to fold in here.
+                    // Report the swap in chat (overlay=false) like the cancel path, so it survives in the
+                    // scrollback. In creative nothing leaves the inventory, so this is the only feedback.
+                    player.displayClientMessage(EurekaAssembler.placementSummary(outcome), false)
                     // The manual % boxes are per-assembly: reset them now that a ship was built (syncs 0% back).
                     AssemblerPreferences.clearBonuses(player.uuid)
                 }
