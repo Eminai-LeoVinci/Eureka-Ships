@@ -128,6 +128,18 @@ class EurekaShipControl : ShipPhysicsListener, ServerTickListener {
     @JsonProperty("cruiseTargetSpeed")
     private var cruiseTargetSpeedMps: Double? = null
 
+    // Additive correction (m/s) that lets the ship actually REACH the speed the helm advertises.
+    // Forward thrust is a proportional controller on velocity error, so the ship settles wherever thrust
+    // balances drag -- always short of the commanded velocity, by a factor that is a property of the hull
+    // rather than anything the estimate can know. Integrating the shortfall drives that error to zero for
+    // any hull without the estimate having to model drag at all, and it closes from both sides: a ship
+    // running over the advertised figure trims down to it just as one running under trims up.
+    // Most of what this was written to answer turned out to be the engine force being consumed on the
+    // first physics tick that read it (see getPlayerForwardVel); what's left for it is genuinely small.
+    // Transient: not persisted, rebuilds within a couple of seconds of driving.
+    @JsonIgnore
+    private var dragTrimMps = 0.0
+
     // Lock-in turn cruise -- the angular twin of oldSpeed. While cruising, holding a turn key spins the
     // ship up (turnAcceleration) and the achieved yaw rate is continuously latched here; releasing freezes
     // it so the ship holds a constant-radius circle hands-off instead of braking straight. Transient like
@@ -796,18 +808,30 @@ class EurekaShipControl : ShipPhysicsListener, ServerTickListener {
             val topRef = max(estimateTopSpeed(), 1.0)
             oldSpeed = (oldSpeed + (target - actualForward) / topRef * CRUISE_SPEED_TRIM).coerceIn(-1.0, 1.0)
         }
-        var speed = oldSpeed * EurekaConfig.SERVER.linearCasualSpeed / 3 // 1 unit -> 3m/s
+        // Target speed in REAL m/s from here down. The base term is the throttle fraction times the
+        // engine-less speed the config allows: linearCasualSpeed/3 is the historical throttle scale and
+        // baseSpeed converts it to m/s, so an engine-less ship still tops out at exactly baseSpeed.
+        var speed = oldSpeed * EurekaConfig.SERVER.linearCasualSpeed / 3 * EurekaConfig.SERVER.baseSpeed
 
         if (extraForceLinear != 0.0) {
             // engine boost
             val boost = max((extraForceLinear - cfg.enginePowerLinear * cfg.engineBoostOffset) * cfg.engineBoost, 0.0)
-            extraForceLinear += boost + boost * boost * EurekaConfig.SERVER.engineBoostExponentialPower
-            extraForceLinear /= scaledMass
+            // Kept in a local. extraForceLinear is a FIELD that onServerTick refreshes from the engines once
+            // per SERVER tick, while this runs once per PHYSICS tick, and there are more of those. Boosting
+            // and dividing it in place therefore CONSUMED it: the first physics tick after a server tick saw
+            // the real engine force, and every one after it saw that force divided by the ship's mass a
+            // second time, i.e. as good as nothing. Those ticks commanded the engine-less base speed, so the
+            // controller braked with a force proportional to the ship's velocity -- which is exactly why the
+            // shortfall behaved like textbook linear drag and kept the same ratio however the config was
+            // scaled. It was never drag; it was the engine force being spent on the first tick that read it.
+            val enginePower =
+                (extraForceLinear + boost + boost * boost * EurekaConfig.SERVER.engineBoostExponentialPower) /
+                    scaledMass
 
             speed += if (speed < 0) {
-                smoothingATanMax(cfg.maxReverseSpeedFromEngines, extraForceLinear * oldSpeed)
+                smoothingATanMax(cfg.maxReverseSpeedFromEngines, enginePower * oldSpeed)
             } else {
-                smoothingATanMax(EurekaConfig.SERVER.maxSpeedFromEngines, extraForceLinear * oldSpeed)
+                smoothingATanMax(EurekaConfig.SERVER.maxSpeedFromEngines, enginePower * oldSpeed)
             }
 
             // Engine heat drain: track how much of the engine power is being used this phys tick
@@ -819,14 +843,43 @@ class EurekaShipControl : ShipPhysicsListener, ServerTickListener {
             physConsumption += if (control.sprintOn) 1f else min(abs(oldSpeed), 1.0).toFloat()
         }
 
+        // Drag trim: integrate the shortfall between the speed being asked for and the speed actually
+        // being made, so the ship converges on the former instead of stalling out below it (see
+        // dragTrimMps). Skipped while a typed cruise target is set, because that path already closes its
+        // own loop on real speed by trimming the throttle -- two integrators on one plant would fight.
+        // forwardVector is still the unit heading here, so this dot product is the forward component of
+        // velocity, which ignores any sideways drift.
+        if (cruiseTargetSpeedMps == null && abs(speed) > DRAG_TRIM_DEAD_ZONE) {
+            val error = speed - vel.dot(forwardVector)
+            // Only correct once the ship is in the last stretch of its run-up. Early in the run the error is
+            // most of the target and isn't a shortfall at all, just acceleration still happening; integrating
+            // it there would wind the correction far past anything the residual justifies and carry the ship
+            // over the top speed the helm advertises, which is meant to be a ceiling. Outside the band the
+            // trim is held rather than bled off, so it survives a burst of throttle or a knock off course.
+            if (abs(error) < abs(speed) * DRAG_TRIM_BAND) {
+                // Bounded so a ship that physically cannot make its speed -- grounded, anchored, or pushing
+                // against something -- winds the trim up to a limit and stops, rather than without end.
+                val maxTrim = abs(speed) * DRAG_TRIM_MAX_FRACTION
+                dragTrimMps = (dragTrimMps + error * DRAG_TRIM_GAIN).coerceIn(-maxTrim, maxTrim)
+            }
+        } else {
+            dragTrimMps *= DRAG_TRIM_RELEASE
+        }
+        speed += dragTrimMps
+
+        // Target velocity, already in m/s. This used to be scaled by baseSpeed a SECOND time here, which
+        // was right for the base term (it cancelled the /3 above) but silently tripled the engine term as
+        // well -- so maxSpeedFromEngines = 24 actually commanded ~72 m/s, and the helm's "Top Speed"
+        // readout, which mirrors this function up to that multiply, reported exactly a third of the real
+        // cap. The base term now carries its own baseSpeed conversion, so the engine term is added in m/s
+        // and the config key finally means what it says.
         forwardVector.mul(speed)
 
         val playerUpDirection = physShip.transform.shipToWorldRotation.transform(Vector3d(0.0, 1.0, 0.0))
         val velOrthogonalToPlayerUp = vel.sub(playerUpDirection.mul(playerUpDirection.dot(vel)), Vector3d())
 
-        // This is the speed that the ship is always allowed to go out, without engines
-        val baseForwardVel = forwardVector.mul(EurekaConfig.SERVER.baseSpeed)
-        val forwardForce = baseForwardVel.sub(velOrthogonalToPlayerUp).mul(scaledMass)
+        // Velocity-error P controller: the target is a true ceiling, since overshooting it flips the sign.
+        val forwardForce = forwardVector.sub(velOrthogonalToPlayerUp).mul(scaledMass)
 
         return forwardForce
     }
@@ -1105,13 +1158,16 @@ class EurekaShipControl : ShipPhysicsListener, ServerTickListener {
      * Estimated forward top speed (m/s) at full engine heat, for the helm-menu "Top Speed:" readout.
      * Mirrors the steady-state of [getPlayerForwardVel] at full throttle (oldSpeed -> 1): the casual base
      * speed plus the engine term, which asymptotes to maxSpeedFromEngines and shrinks with mass (heavier
-     * or fewer engines -> slower). Returns baseSpeed for an engine-less ship. An ESTIMATE only -- the
-     * realized speed varies with live engine heat/fuel, which is why the UI suffixes it with "~".
+     * or fewer engines -> slower). Returns baseSpeed for an engine-less ship.
+     *
+     * This is the velocity the controller TARGETS, so it is a genuine ceiling -- the ship can no longer
+     * blow past it under manual throttle. It stays an estimate, and the UI keeps its "~", because drag
+     * leaves a realized speed a little under the target and live engine heat/fuel moves the engine term.
      */
     fun estimateTopSpeed(): Double {
         val mass = ship?.inertiaData?.shipMass ?: return EurekaConfig.SERVER.baseSpeed
         val scaledMass = mass * EurekaConfig.SERVER.speedMassScale
-        var speed = EurekaConfig.SERVER.linearCasualSpeed / 3.0 // oldSpeed -> 1
+        var speed = EurekaConfig.SERVER.linearCasualSpeed / 3.0 * EurekaConfig.SERVER.baseSpeed // oldSpeed -> 1
         val fullPower = engines * cfg.enginePowerLinear.toDouble()
         if (fullPower > 0.0 && scaledMass > 0.0) {
             var extra = fullPower
@@ -1156,6 +1212,20 @@ class EurekaShipControl : ShipPhysicsListener, ServerTickListener {
         // reaches ~86 deg/s on large ships, which is too aggressive for a cruise orbit; this bounds the typed
         // value so the tightest settable circle stays reasonable. Only limits the MENU set, not driving.
         private const val CRUISE_TURN_DEG_MAX = 16.0
+
+        // Drag-trim dials (see dragTrimMps). GAIN is per physics tick and deliberately far slower than the
+        // force controller it wraps, so the outer loop can't oscillate against the inner one; raise it for
+        // a quicker settle onto top speed, lower it if the speed hunts. BAND is how close to the target the
+        // ship must already be before the correction starts accumulating at all. MAX_FRACTION then caps it,
+        // as anti-windup for a ship that cannot move. Both are deliberately small: this now answers only the
+        // real residual, the large shortfall it was originally sized for having turned out to be the engine
+        // force being consumed on the first physics tick that read it. RELEASE bleeds the trim away when the
+        // pilot lets off, so it never carries a stale correction into the next run.
+        private const val DRAG_TRIM_GAIN = 0.03
+        private const val DRAG_TRIM_BAND = 0.25
+        private const val DRAG_TRIM_MAX_FRACTION = 0.25
+        private const val DRAG_TRIM_RELEASE = 0.9
+        private const val DRAG_TRIM_DEAD_ZONE = 0.05
 
         // Per-tick gain of the closed-loop throttle trim that lands a menu-typed forward speed on its exact m/s
         // (see cruiseTargetSpeedMps). Small so the outer loop stays slower than the inner force P-controller and

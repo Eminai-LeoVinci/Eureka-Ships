@@ -35,9 +35,14 @@ class ShipHelmScreenMenu(syncId: Int, playerInv: Inventory, private val blockEnt
     private var syncedVanilla = false
     private var syncedEnginePower = -1 // -1 = ship has no engines (helm shows "--")
     private var syncedCruiseFlags = 0  // bit0 cruising, bit1 speedArmed, bit2 turnArmed, bit3 verticalArmed
-    private var syncedCruiseSpeed = 0  // m/s, signed (+forward / -reverse)
-    private var syncedCruiseTurn = 0   // deg/s, signed
-    private var syncedCruiseVertical = 0 // m/s, signed (+up / -down)
+    // Cruise readouts, each in signed thousandths split low/high (a DataSlot transmits only a 16-bit short):
+    // speed m/s (+forward / -reverse), turn deg/s, vertical m/s (+up / -down).
+    private var syncedCruiseSpeedLow = 0
+    private var syncedCruiseSpeedHigh = 0
+    private var syncedCruiseTurnLow = 0
+    private var syncedCruiseTurnHigh = 0
+    private var syncedCruiseVerticalLow = 0
+    private var syncedCruiseVerticalHigh = 0
     private var syncedAssembler = 0    // bit0 enabled, bit1 floater, bit2 balloon
     private var syncedFloaterBonus = 0 // transient "Auto Floaters + N%" textbox value (per-player)
     private var syncedBalloonBonus = 0 // transient "Auto Balloons + N%" textbox value (per-player)
@@ -97,19 +102,35 @@ class ShipHelmScreenMenu(syncId: Int, playerInv: Inventory, private val blockEnt
             }
             override fun set(value: Int) { syncedCruiseFlags = value }
         })
-        // Current latched cruise values in HUNDREDTHS of a unit (signed m/s or deg/s * 100) for the textbox
-        // readouts -- scaled so the client can show two decimals over the 16-bit short DataSlot.
+        // Current latched cruise values in THOUSANDTHS of a unit (signed m/s or deg/s * 1000) for the textbox
+        // readouts, so the client can show three decimals. At that scale a value no longer fits the 16-bit
+        // short a DataSlot transmits -- a 45 m/s ship alone is 45000 against a ceiling of 32767 -- so each
+        // one is split low/high the same way the block count and ship mass above are. Splitting all three
+        // rather than only speed keeps a raised baseImpulseDescendRate or turn cap from silently wrapping
+        // its readout negative.
         addDataSlot(object : DataSlot() {
-            override fun get(): Int = blockEntity?.cruiseSpeedHundredths ?: 0
-            override fun set(value: Int) { syncedCruiseSpeed = value.toShort().toInt() }
+            override fun get(): Int = (blockEntity?.cruiseSpeedThousandths ?: 0) and 0xFFFF
+            override fun set(value: Int) { syncedCruiseSpeedLow = value }
         })
         addDataSlot(object : DataSlot() {
-            override fun get(): Int = blockEntity?.cruiseTurnHundredths ?: 0
-            override fun set(value: Int) { syncedCruiseTurn = value.toShort().toInt() }
+            override fun get(): Int = (blockEntity?.cruiseSpeedThousandths ?: 0) shr 16
+            override fun set(value: Int) { syncedCruiseSpeedHigh = value }
         })
         addDataSlot(object : DataSlot() {
-            override fun get(): Int = blockEntity?.cruiseVerticalHundredths ?: 0
-            override fun set(value: Int) { syncedCruiseVertical = value.toShort().toInt() }
+            override fun get(): Int = (blockEntity?.cruiseTurnThousandths ?: 0) and 0xFFFF
+            override fun set(value: Int) { syncedCruiseTurnLow = value }
+        })
+        addDataSlot(object : DataSlot() {
+            override fun get(): Int = (blockEntity?.cruiseTurnThousandths ?: 0) shr 16
+            override fun set(value: Int) { syncedCruiseTurnHigh = value }
+        })
+        addDataSlot(object : DataSlot() {
+            override fun get(): Int = (blockEntity?.cruiseVerticalThousandths ?: 0) and 0xFFFF
+            override fun set(value: Int) { syncedCruiseVerticalLow = value }
+        })
+        addDataSlot(object : DataSlot() {
+            override fun get(): Int = (blockEntity?.cruiseVerticalThousandths ?: 0) shr 16
+            override fun set(value: Int) { syncedCruiseVerticalHigh = value }
         })
         // Eureka Assembler preferences (per-player, bit-packed): master + floater + balloon.
         addDataSlot(object : DataSlot() {
@@ -177,10 +198,14 @@ class ShipHelmScreenMenu(syncId: Int, playerInv: Inventory, private val blockEnt
     val cruiseSpeedArmed: Boolean get() = blockEntity?.cruiseSpeedArmed ?: (syncedCruiseFlags and 2 != 0)
     val cruiseTurnArmed: Boolean get() = blockEntity?.cruiseTurnArmed ?: (syncedCruiseFlags and 4 != 0)
     val cruiseVerticalArmed: Boolean get() = blockEntity?.cruiseVerticalArmed ?: (syncedCruiseFlags and 8 != 0)
-    // Hundredths of a unit (see the DataSlots above); the screen divides by 100 for its two-decimal display.
-    val cruiseSpeed: Int get() = blockEntity?.cruiseSpeedHundredths ?: syncedCruiseSpeed
-    val cruiseTurn: Int get() = blockEntity?.cruiseTurnHundredths ?: syncedCruiseTurn
-    val cruiseVertical: Int get() = blockEntity?.cruiseVerticalHundredths ?: syncedCruiseVertical
+    // Thousandths of a unit (see the DataSlots above); the screen divides by 1000 for its three-decimal
+    // display. Masking the low half discards the sign the short arrived with, so the high half restores it.
+    val cruiseSpeed: Int get() = blockEntity?.cruiseSpeedThousandths
+        ?: ((syncedCruiseSpeedHigh shl 16) or (syncedCruiseSpeedLow and 0xFFFF))
+    val cruiseTurn: Int get() = blockEntity?.cruiseTurnThousandths
+        ?: ((syncedCruiseTurnHigh shl 16) or (syncedCruiseTurnLow and 0xFFFF))
+    val cruiseVertical: Int get() = blockEntity?.cruiseVerticalThousandths
+        ?: ((syncedCruiseVerticalHigh shl 16) or (syncedCruiseVerticalLow and 0xFFFF))
 
     // Eureka Assembler prefs (per-player).
     val assemblerEnabled: Boolean get() = syncedAssembler and 1 != 0
